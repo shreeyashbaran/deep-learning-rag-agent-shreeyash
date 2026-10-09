@@ -1,4 +1,3 @@
-> **Part 1 completed:** See [the Part 1 run and submission guide](docs/PART01_COMPLETION.md). Start the Markdown-only demo with `uv run streamlit run src/rag_agent/ui/app.py`. Later workshop LangGraph sections below remain starter material.
 
 # Deep Learning RAG Interview Prep Agent
 

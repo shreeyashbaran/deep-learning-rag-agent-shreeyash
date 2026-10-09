@@ -19,7 +19,6 @@ from langchain_core.language_models.chat_models import BaseChatModel
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-
 # ---------------------------------------------------------------------------
 # Enumerations
 # ---------------------------------------------------------------------------
@@ -63,7 +62,7 @@ class Settings(BaseSettings):
     # LLM provider
     llm_provider: LLMProvider = LLMProvider.GROQ
     groq_api_key: str = Field(default="", alias="GROQ_API_KEY")
-    groq_model: str = Field(default="llama-3.1-8b-instant", alias="GROQ_MODEL")
+    groq_model: str = Field(default="openai/gpt-oss-20b", alias="GROQ_MODEL")
     ollama_base_url: str = Field(
         default="http://localhost:11434", alias="OLLAMA_BASE_URL"
     )
@@ -75,9 +74,7 @@ class Settings(BaseSettings):
 
     # Embeddings
     embedding_provider: EmbeddingProvider = EmbeddingProvider.LOCAL
-    embedding_model: str = Field(
-        default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL"
-    )
+    embedding_model: str = Field(default="all-MiniLM-L6-v2", alias="EMBEDDING_MODEL")
 
     # Vector store
     chroma_db_path: str = Field(default="./data/chroma_db", alias="CHROMA_DB_PATH")
@@ -87,12 +84,8 @@ class Settings(BaseSettings):
 
     # Retrieval
     retrieval_k: int = Field(default=4, alias="RETRIEVAL_K")
-    similarity_threshold: float = Field(
-        default=0.3, alias="SIMILARITY_THRESHOLD"
-    )
-    max_context_tokens: int = Field(
-        default=3000, alias="MAX_CONTEXT_TOKENS"
-    )
+    similarity_threshold: float = Field(default=0.3, alias="SIMILARITY_THRESHOLD")
+    max_context_tokens: int = Field(default=3000, alias="MAX_CONTEXT_TOKENS")
 
     # Application
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -170,13 +163,22 @@ class LLMFactory:
         Create a Groq-backed chat model.
 
         Requires GROQ_API_KEY in environment.
-        Recommended models: llama-3.1-8b-instant (fast), llama-3.1-70b-versatile (quality)
+        Workshop model: openai/gpt-oss-20b, selected through GROQ_MODEL.
 
         Interview talking point: Groq uses LPU (Language Processing Unit)
         inference for significantly lower latency than GPU-based inference.
         """
-        # TODO: implement using langchain_groq.ChatGroq
-        raise NotImplementedError
+        from langchain_groq import ChatGroq
+
+        if not self._settings.groq_api_key.strip():
+            raise EnvironmentError("GROQ_API_KEY is missing.")
+        return ChatGroq(
+            model=self._settings.groq_model,
+            groq_api_key=self._settings.groq_api_key,
+            temperature=0,
+            timeout=60,
+            max_retries=2,
+        )
 
     def _create_ollama(self) -> BaseChatModel:
         """
@@ -265,8 +267,12 @@ class EmbeddingFactory:
         Interview talking point: local embeddings mean the corpus content
         never leaves the machine — important for proprietary datasets.
         """
-        # TODO: implement using langchain_community.embeddings.HuggingFaceEmbeddings
-        raise NotImplementedError
+        from langchain_community.embeddings import HuggingFaceEmbeddings
+
+        return HuggingFaceEmbeddings(
+            model_name=self._settings.embedding_model,
+            model_kwargs={"device": "cpu"},
+        )
 
     def _create_openai(self):
         """

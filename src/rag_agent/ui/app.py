@@ -1,313 +1,230 @@
-"""
-app.py
-======
-Streamlit user interface for the Deep Learning RAG Interview Prep Agent.
+"""Streamlit application for the Markdown-only Part 1 RAG workshop.
 
-Three-panel layout:
-  - Left sidebar: Document ingestion and corpus browser
-  - Centre: Document viewer
-  - Right: Chat interface
+Run from the repository root:
+    uv run streamlit run src/rag_agent/ui/app.py
 
-API contract with the backend (agree this with Pipeline Engineer
-before building anything):
-
-  ingest(file_paths: list[Path]) -> IngestionResult
-  list_documents() -> list[dict]
-  get_document_chunks(source: str) -> list[DocumentChunk]
-  chat(query: str, history: list[dict], filters: dict) -> AgentResponse
-
-PEP 8 | OOP | Single Responsibility
+Part 1 uses direct retrieval and generation. The starter LangGraph agent is
+reserved for later workshop parts and is not invoked by this application.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import streamlit as st
+from loguru import logger
 
-from rag_agent.agent.graph import get_compiled_graph
-from rag_agent.agent.state import AgentResponse
-from rag_agent.config import get_settings
+from rag_agent.agent.state import IngestionResult
+from rag_agent.config import LLMFactory, get_settings
 from rag_agent.corpus.chunker import DocumentChunker
+from rag_agent.qa import answer_question
 from rag_agent.vectorstore.store import VectorStoreManager
 
 
-# ---------------------------------------------------------------------------
-# Cached Resources
-# ---------------------------------------------------------------------------
-# Use st.cache_resource for objects that should persist across reruns
-# and be shared across all user sessions. This prevents re-initialising
-# ChromaDB and reloading the embedding model on every button click.
-
-
+# Cached resources survive Streamlit reruns.
 @st.cache_resource
 def get_vector_store() -> VectorStoreManager:
-    """
-    Return the singleton VectorStoreManager.
-
-    Cached so ChromaDB connection is initialised once per application
-    session, not on every Streamlit rerun.
-    """
     return VectorStoreManager()
 
 
 @st.cache_resource
 def get_chunker() -> DocumentChunker:
-    """Return the singleton DocumentChunker."""
     return DocumentChunker()
 
 
 @st.cache_resource
-def get_graph():
-    """Return the compiled LangGraph agent."""
-    return get_compiled_graph()
-
-
-# ---------------------------------------------------------------------------
-# Session State Initialisation
-# ---------------------------------------------------------------------------
+def get_llm():
+    """Configure the Groq client once, when the first question is submitted."""
+    return LLMFactory().create()
 
 
 def initialise_session_state() -> None:
-    """
-    Initialise all st.session_state keys on first run.
-
-    Must be called at the top of main() before any UI is rendered.
-    Without this, state keys referenced in callbacks will raise KeyError.
-
-    Interview talking point: Streamlit reruns the entire script on every
-    user interaction. session_state is the mechanism for persisting data
-    (chat history, ingestion results) across reruns.
-    """
     defaults = {
-        "chat_history": [],           # list of {"role": "user"|"assistant", "content": str}
-        "ingested_documents": [],     # list of dicts from list_documents()
-        "selected_document": None,    # source filename currently in viewer
+        "chat_history": [],
+        "ingested_documents": [],
+        "selected_document": None,
         "last_ingestion_result": None,
-        "thread_id": "default-session",  # LangGraph conversation thread
         "topic_filter": None,
         "difficulty_filter": None,
     }
-    for key, default in defaults.items():
+    for key, value in defaults.items():
         if key not in st.session_state:
-            st.session_state[key] = default
+            st.session_state[key] = value
 
 
-# ---------------------------------------------------------------------------
-# Ingestion Panel (Sidebar)
-# ---------------------------------------------------------------------------
-
-
-def render_ingestion_panel(
-    store: VectorStoreManager,
-    chunker: DocumentChunker,
-) -> None:
-    """
-    Render the document ingestion panel in the sidebar.
-
-    Allows multi-file upload of PDF and Markdown files. Displays
-    ingestion results (chunks added, duplicates skipped, errors).
-    Updates the ingested documents list after successful ingestion.
-
-    Parameters
-    ----------
-    store : VectorStoreManager
-    chunker : DocumentChunker
-    """
+def render_ingestion_panel(store: VectorStoreManager, chunker: DocumentChunker) -> None:
+    """Upload Markdown documents, report ingestion, and browse/remove sources."""
     st.sidebar.header("📂 Corpus Ingestion")
+    files = st.sidebar.file_uploader(
+        "Upload study notes (.md)", type=["md"], accept_multiple_files=True
+    )
+    if st.sidebar.button("Ingest Documents", disabled=not files):
+        result = IngestionResult()
+        with st.spinner("Chunking and embedding documents..."):
+            with TemporaryDirectory(prefix="rag-upload-") as temporary:
+                for upload in files:
+                    name = Path(upload.name.replace("\\", "/")).name
+                    try:
+                        path = Path(temporary) / name
+                        path.write_bytes(upload.getvalue())
+                        chunks = chunker.chunk_file(path)
+                        if not chunks:
+                            result.errors.append(f"{name}: document has no text")
+                            continue
+                        current = store.ingest(chunks)
+                        result.ingested += current.ingested
+                        result.skipped += current.skipped
+                        result.errors.extend(current.errors)
+                        result.document_ids.extend(current.document_ids)
+                    except Exception as exc:
+                        logger.exception("Failed to ingest {}", name)
+                        result.errors.append(f"{name}: {type(exc).__name__}")
+        st.session_state.last_ingestion_result = result
 
-    # TODO: implement
-    # 1. st.sidebar.file_uploader(
-    #        "Upload study materials",
-    #        type=["pdf", "md"],
-    #        accept_multiple_files=True
-    #    )
-    #
-    # 2. "Ingest Documents" button — only enabled when files are selected
-    #
-    # 3. On button click:
-    #    a. Save uploaded files to a temp directory
-    #    b. chunker.chunk_files(file_paths)
-    #    c. store.ingest(chunks) → IngestionResult
-    #    d. Display result: st.success / st.warning / st.error
-    #       Show: "{result.ingested} chunks added, {result.skipped} duplicates skipped"
-    #    e. Refresh ingested documents list in session_state
-    #
-    # 4. Render ingested documents list below the uploader
-    #    For each document: show source name, topic, chunk count
-    #    Add a small "🗑 Remove" button per document that calls store.delete_document()
+    result = st.session_state.last_ingestion_result
+    if result is not None:
+        summary = f"{result.ingested} chunks added, {result.skipped} duplicates skipped"
+        if result.errors:
+            st.sidebar.warning(summary)
+            for error in result.errors:
+                st.sidebar.error(error)
+        elif result.ingested:
+            st.sidebar.success(summary)
+        else:
+            st.sidebar.info(summary)
 
-    st.sidebar.info("Upload .pdf or .md files to populate the corpus.")
+    documents = store.list_documents()
+    st.session_state.ingested_documents = documents
+    st.sidebar.subheader("Stored documents")
+    if not documents:
+        st.sidebar.info("Upload a Markdown note to begin.")
+    for document in documents:
+        st.sidebar.write(
+            f"**{document['source']}** — {document['topic']} "
+            f"({document['chunk_count']} chunks)"
+        )
+        if st.sidebar.button("Remove", key=f"remove:{document['source']}"):
+            store.delete_document(document["source"])
+            st.session_state.last_ingestion_result = None
+            st.rerun()
+    st.sidebar.caption(
+        "To replace an edited note, remove its old source before uploading it again."
+    )
 
 
 def render_corpus_stats(store: VectorStoreManager) -> None:
-    """
-    Render a compact corpus health summary in the sidebar.
-
-    Shows total chunks, topics covered, and whether bonus topics
-    are present. Used during Hour 3 to demonstrate corpus completeness.
-
-    Parameters
-    ----------
-    store : VectorStoreManager
-    """
-    # TODO: implement
-    # stats = store.get_collection_stats()
-    # st.sidebar.metric("Total Chunks", stats["total_chunks"])
-    # st.sidebar.write("Topics:", ", ".join(stats["topics"]))
-    # if stats["bonus_topics_present"]:
-    #     st.sidebar.success("✅ Bonus topics present")
-    # else:
-    #     st.sidebar.warning("⚠️ No bonus topics yet")
-    pass
-
-
-# ---------------------------------------------------------------------------
-# Document Viewer Panel (Centre)
-# ---------------------------------------------------------------------------
+    stats = store.get_collection_stats()
+    st.sidebar.metric("Total Chunks", stats["total_chunks"])
+    st.sidebar.write("Topics:", ", ".join(stats["topics"]) or "None yet")
+    if stats["bonus_topics_present"]:
+        st.sidebar.success("Bonus topics present")
 
 
 def render_document_viewer(store: VectorStoreManager) -> None:
-    """
-    Render the document viewer in the main centre column.
-
-    Displays a selectable list of ingested documents. When a document
-    is selected, renders its chunk content in a scrollable pane.
-
-    Parameters
-    ----------
-    store : VectorStoreManager
-    """
     st.subheader("📄 Document Viewer")
-
-    # TODO: implement
-    # 1. If no documents ingested: show placeholder message
-    #
-    # 2. st.selectbox("Select document", options=[doc["source"] for doc in docs])
-    #    Store selection in st.session_state["selected_document"]
-    #
-    # 3. On selection change: store.get_document_chunks(selected_source)
-    #
-    # 4. Render chunks in a scrollable container (st.container with fixed height)
-    #    For each chunk:
-    #    - Show metadata badge: topic | difficulty | type
-    #    - Show chunk text
-    #    - Show similarity score if this chunk was used in last response
-    #
-    # 5. Display chunk count and coverage summary below viewer
-
-    st.info("Ingest documents using the sidebar to view content here.")
-
-
-# ---------------------------------------------------------------------------
-# Chat Interface Panel (Right)
-# ---------------------------------------------------------------------------
+    documents = st.session_state.ingested_documents
+    if not documents:
+        st.info("Ingest a Markdown note using the sidebar.")
+        return
+    source = st.selectbox(
+        "Select document", options=[document["source"] for document in documents]
+    )
+    st.session_state.selected_document = source
+    chunks = store.get_document_chunks(source)
+    with st.container(height=450):
+        for index, chunk in enumerate(chunks, start=1):
+            st.caption(
+                f"Chunk {index} | {chunk.metadata.topic} | "
+                f"{chunk.metadata.difficulty} | {chunk.metadata.type}"
+            )
+            st.markdown(chunk.chunk_text)
+            st.divider()
+    st.caption(f"{len(chunks)} chunks stored for this document.")
 
 
-def render_chat_interface(graph) -> None:
-    """
-    Render the chat interface in the right column.
-
-    Supports multi-turn conversation with the LangGraph agent.
-    Displays source citations with every response.
-    Shows a clear "no relevant context" indicator when the
-    hallucination guard fires.
-
-    Parameters
-    ----------
-    graph : CompiledStateGraph
-        The compiled LangGraph agent from get_compiled_graph().
-    """
-    st.subheader("💬 Interview Prep Chat")
-
-    # Filters
-    col_topic, col_diff = st.columns(2)
-    with col_topic:
-        # TODO: st.selectbox for topic filter
-        pass
-    with col_diff:
-        # TODO: st.selectbox for difficulty filter
-        pass
-
-    # Chat history display
-    chat_container = st.container(height=400)
-    with chat_container:
+def render_chat_interface(store: VectorStoreManager) -> None:
+    """Retrieve context, call the cached LLM, and persist answers and sources."""
+    st.subheader("💬 RAG Question and Answer")
+    topics = store.get_collection_stats()["topics"]
+    topic_column, difficulty_column = st.columns(2)
+    with topic_column:
+        topic = st.selectbox("Topic", ["All topics", *topics])
+    with difficulty_column:
+        difficulty = st.selectbox(
+            "Difficulty", ["All levels", "beginner", "intermediate", "advanced"]
+        )
+    topic_filter = None if topic == "All topics" else topic
+    difficulty_filter = None if difficulty == "All levels" else difficulty
+    st.session_state.topic_filter = topic_filter
+    st.session_state.difficulty_filter = difficulty_filter
+    with st.container(height=450):
         for message in st.session_state.chat_history:
             with st.chat_message(message["role"]):
                 st.markdown(message["content"])
                 if message.get("sources"):
-                    with st.expander("📎 Sources"):
+                    with st.expander("📎 Retrieved sources", expanded=True):
                         for source in message["sources"]:
                             st.caption(source)
                 if message.get("no_context_found"):
-                    st.warning("⚠️ No relevant content found in corpus.")
-
-    # Chat input
-    # TODO: implement
-    # 1. query = st.chat_input("Ask about a deep learning topic...")
-    #
-    # 2. On submit:
-    #    a. Append user message to chat_history
-    #    b. Display user message immediately (st.rerun or direct render)
-    #    c. Build LangGraph input:
-    #       {"messages": [HumanMessage(content=query)]}
-    #    d. config = {"configurable": {"thread_id": st.session_state.thread_id}}
-    #    e. result = graph.invoke(input, config=config)
-    #    f. response = result["final_response"]
-    #    g. Append assistant message with answer, sources, no_context_found flag
-    #
-    # STRETCH GOAL — streaming:
-    # Replace graph.invoke with graph.stream() and use st.write_stream()
-    # to display tokens as they arrive. Significant "wow factor" in Hour 3.
-
-
-# ---------------------------------------------------------------------------
-# Main Application
-# ---------------------------------------------------------------------------
+                    st.warning("No relevant context was retrieved.")
+    query = st.chat_input("Ask a question about your uploaded notes...")
+    if query:
+        st.session_state.chat_history.append({"role": "user", "content": query})
+        try:
+            with st.spinner("Retrieving context and generating an answer..."):
+                response = answer_question(
+                    query,
+                    store,
+                    get_llm(),
+                    get_settings(),
+                    topic_filter=topic_filter,
+                    difficulty_filter=difficulty_filter,
+                )
+            message = {
+                "role": "assistant",
+                "content": response.answer,
+                "sources": response.sources,
+                "no_context_found": response.no_context_found,
+            }
+        except Exception as exc:
+            logger.exception("RAG request failed")
+            message = {
+                "role": "assistant",
+                "content": (
+                    f"The request failed ({type(exc).__name__}). "
+                    "Check your local terminal for details and your .env settings."
+                ),
+            }
+        st.session_state.chat_history.append(message)
+        st.rerun()
+    if st.button("Clear chat"):
+        st.session_state.chat_history = []
+        st.rerun()
 
 
 def main() -> None:
-    """
-    Application entry point.
-
-    Sets page config, initialises session state, instantiates shared
-    resources, and renders all UI panels.
-
-    Run with: uv run streamlit run src/rag_agent/ui/app.py
-    """
     settings = get_settings()
-
-    st.set_page_config(
-        page_title=settings.app_title,
-        page_icon="🧠",
-        layout="wide",
-        initial_sidebar_state="expanded",
-    )
-
+    st.set_page_config(page_title=settings.app_title, page_icon="🧠", layout="wide")
     st.title(f"🧠 {settings.app_title}")
-    st.caption(
-        "RAG-powered interview preparation — built with LangChain, LangGraph, and ChromaDB"
-    )
-
+    st.caption("Part 1 · Markdown RAG · Local embeddings · ChromaDB · Groq")
     initialise_session_state()
-
-    # Instantiate shared backend resources
-    store = get_vector_store()
-    chunker = get_chunker()
-    graph = get_graph()
-
-    # Sidebar
+    try:
+        store = get_vector_store()
+        chunker = get_chunker()
+    except Exception as exc:
+        logger.exception("RAG startup failed")
+        st.error(
+            f"Startup failed ({type(exc).__name__}). Check the terminal for details."
+        )
+        st.stop()
     render_ingestion_panel(store, chunker)
     render_corpus_stats(store)
-
-    # Main content area — two columns
-    viewer_col, chat_col = st.columns([1, 1], gap="large")
-
-    with viewer_col:
+    viewer_column, chat_column = st.columns([1, 1], gap="large")
+    with viewer_column:
         render_document_viewer(store)
-
-    with chat_col:
-        render_chat_interface(graph)
+    with chat_column:
+        render_chat_interface(store)
 
 
 if __name__ == "__main__":

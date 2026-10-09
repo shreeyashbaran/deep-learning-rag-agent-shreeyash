@@ -103,6 +103,7 @@ class DocumentChunk:
     chunk_id: str
     chunk_text: str
     metadata: ChunkMetadata
+    chunk_index: int = 0
 
 
 @dataclass
